@@ -63,7 +63,10 @@ func Start(name string, opts StartOptions) (*Instance, error) {
 		return nil, err
 	}
 	st, err := GetStatus(name)
-	if err == nil && st.Running {
+	if err != nil {
+		return nil, err
+	}
+	if st.Running {
 		return nil, fmt.Errorf("agent %q already running (PID %d)", name, st.PID)
 	}
 
@@ -93,6 +96,8 @@ func Start(name string, opts StartOptions) (*Instance, error) {
 		if err != nil {
 			return nil, err
 		}
+	} else if err := ensurePortAvailable(port); err != nil {
+		return nil, err
 	}
 
 	if err := os.MkdirAll(p.stateDir, 0o755); err != nil {
@@ -386,6 +391,14 @@ func freePort() (int, error) {
 		return 0, fmt.Errorf("unexpected listener address %q", ln.Addr())
 	}
 	return addr.Port, nil
+}
+
+func ensurePortAvailable(port int) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return fmt.Errorf("port %d is not available: %w", port, err)
+	}
+	return ln.Close()
 }
 
 func expandHome(path string) string {

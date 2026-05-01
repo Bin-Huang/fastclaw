@@ -231,7 +231,9 @@ fastclaw agents config scratch set sandbox '{"enabled":true,"backend":"docker"}'
 ```
 
 System files are stored in the local instance database under the configured
-agent/user scope:
+agent/user scope. Supported filenames are `SOUL.md`, `IDENTITY.md`, `USER.md`,
+`BOOTSTRAP.md`, `MEMORY.md`, `HEARTBEAT.md`, `AGENTS.md`, `TOOLS.md`, and
+`agent.json`:
 
 ```bash
 fastclaw agents files ls scratch

@@ -63,7 +63,20 @@ func Init(name string, opts InitOptions) (*InitResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	existing, _ := loadInstance(p.metaFile)
+	existing, err := loadInstance(p.metaFile)
+	if errors.Is(err, os.ErrNotExist) {
+		existing = nil
+	} else if err != nil {
+		return nil, err
+	}
+	if existing != nil && isProcessAlive(existing.PID) {
+		if opts.Home != "" && expandHome(opts.Home) != existing.Home {
+			return nil, fmt.Errorf("agent %q is running; stop it before changing --home", name)
+		}
+		if opts.Port > 0 && opts.Port != existing.Port {
+			return nil, fmt.Errorf("agent %q is running; stop it before changing --port", name)
+		}
+	}
 	home := opts.Home
 	if home == "" && existing != nil {
 		home = existing.Home
@@ -116,13 +129,20 @@ func Init(name string, opts InitOptions) (*InitResult, error) {
 	if agentName == "" {
 		agentName = name
 	}
+	agentConfig := map[string]interface{}{}
+	if rec, err := st.GetAgent(ctx, agentID); err == nil && rec != nil && rec.Config != nil {
+		agentConfig = rec.Config
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
 	agentRec := &store.AgentRecord{
 		ID:     agentID,
 		UserID: acct.ID,
 		Name:   agentName,
+		Config: agentConfig,
 	}
 	if opts.Description != "" {
-		agentRec.Config = map[string]interface{}{"description": opts.Description}
+		agentRec.Config["description"] = opts.Description
 	}
 	if err := st.SaveAgent(ctx, agentRec); err != nil {
 		return nil, err
@@ -134,17 +154,19 @@ func Init(name string, opts InitOptions) (*InitResult, error) {
 		}
 		providerSaved = true
 		if fullModel != "" {
-			if err := scope.SaveSetting(ctx, st, scope.System, "", "agents.defaults", map[string]interface{}{"model": fullModel}); err != nil {
+			if err := saveSettingValue(ctx, st, "agents.defaults", []string{"model"}, fullModel); err != nil {
 				return nil, err
 			}
 			modelSaved = true
 		}
 	}
 	if opts.SandboxEnabled {
-		data := map[string]interface{}{
-			"enabled": true,
-			"backend": defaultStr(opts.SandboxBackend, "docker"),
+		data, err := loadSettingMap(ctx, st, "sandbox")
+		if err != nil {
+			return nil, err
 		}
+		data["enabled"] = true
+		data["backend"] = defaultStr(opts.SandboxBackend, "docker")
 		if opts.SandboxImage != "" {
 			data["image"] = opts.SandboxImage
 		}
@@ -264,6 +286,9 @@ func GetConfig(name, key string) (interface{}, error) {
 
 // PutFile writes an agent system file for the configured local agent.
 func PutFile(name, filename, srcPath string) error {
+	if err := validateSystemFilename(filename); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(srcPath)
 	if err != nil {
 		return err
@@ -281,6 +306,9 @@ func PutFile(name, filename, srcPath string) error {
 
 // GetFile reads an agent system file.
 func GetFile(name, filename string) ([]byte, error) {
+	if err := validateSystemFilename(filename); err != nil {
+		return nil, err
+	}
 	st, inst, err := storeForName(name)
 	if err != nil {
 		return nil, err
@@ -302,7 +330,17 @@ func ListFiles(name string) ([]string, error) {
 	if err := ensureConfigured(inst); err != nil {
 		return nil, err
 	}
-	return st.ListAgentFiles(context.Background(), inst.AgentID, inst.UserID)
+	files, err := st.ListAgentFiles(context.Background(), inst.AgentID, inst.UserID)
+	if err != nil {
+		return nil, err
+	}
+	out := files[:0]
+	for _, file := range files {
+		if systemFileAllowlist[file] {
+			out = append(out, file)
+		}
+	}
+	return out, nil
 }
 
 func openInstanceStore(home string) (store.Store, error) {
@@ -392,6 +430,12 @@ func normalizeProviderModel(providerName, model string) (string, string, string,
 	modelID := model
 	if strings.Contains(model, "/") {
 		parts := strings.SplitN(model, "/", 2)
+		if parts[0] == "" || parts[1] == "" {
+			return "", "", "", fmt.Errorf("invalid model %q: expected <provider>/<model>", model)
+		}
+		if providerName != "" && providerName != parts[0] {
+			return "", "", "", fmt.Errorf("--provider %q does not match model provider prefix %q", providerName, parts[0])
+		}
 		if providerName == "" {
 			providerName = parts[0]
 		}
@@ -478,6 +522,8 @@ func setProviderField(ctx context.Context, st store.Store, key, rawValue string)
 		_ = json.Unmarshal(blob, &pc)
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
+	} else {
+		pc = providerConfigFromPreset(name)
 	}
 	switch field {
 	case "apiKeyEnv":
@@ -503,6 +549,15 @@ func setProviderField(ctx context.Context, st store.Store, key, rawValue string)
 		return fmt.Errorf("unsupported provider field %q", field)
 	}
 	return scope.SaveProvider(ctx, st, scope.System, "", name, pc)
+}
+
+func providerConfigFromPreset(providerName string) config.ProviderConfig {
+	preset := providerPreset(providerName)
+	return config.ProviderConfig{
+		APIBase:  preset.apiBase,
+		APIType:  preset.apiType,
+		AuthType: preset.authType,
+	}
 }
 
 func getProviderField(ctx context.Context, st store.Store, key string) (interface{}, error) {
@@ -635,6 +690,35 @@ func setNested(data map[string]interface{}, path []string, value interface{}) {
 	cur[path[len(path)-1]] = value
 }
 
+func loadSettingMap(ctx context.Context, st store.Store, namespace string) (map[string]interface{}, error) {
+	if rec, err := st.GetConfigByName(ctx, store.KindSetting, scope.System, "", namespace); err == nil && rec != nil {
+		if rec.Data != nil {
+			return rec.Data, nil
+		}
+		return map[string]interface{}{}, nil
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	return map[string]interface{}{}, nil
+}
+
+func saveSettingValue(ctx context.Context, st store.Store, namespace string, path []string, value interface{}) error {
+	data, err := loadSettingMap(ctx, st, namespace)
+	if err != nil {
+		return err
+	}
+	if len(path) == 0 {
+		obj, ok := value.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("config namespace %q expects a JSON object value", namespace)
+		}
+		data = obj
+	} else {
+		setNested(data, path, value)
+	}
+	return scope.SaveSetting(ctx, st, scope.System, "", namespace, data)
+}
+
 func getNested(data map[string]interface{}, path []string) interface{} {
 	var cur interface{} = data
 	for _, p := range path {
@@ -667,6 +751,25 @@ func parseValue(raw string) interface{} {
 func ensureConfigured(inst *Instance) error {
 	if inst == nil || inst.AgentID == "" || inst.UserID == "" {
 		return errors.New("agent is not initialized; run `fastclaw agents init <name>` first")
+	}
+	return nil
+}
+
+var systemFileAllowlist = map[string]bool{
+	"SOUL.md":      true,
+	"IDENTITY.md":  true,
+	"USER.md":      true,
+	"BOOTSTRAP.md": true,
+	"MEMORY.md":    true,
+	"HEARTBEAT.md": true,
+	"AGENTS.md":    true,
+	"TOOLS.md":     true,
+	"agent.json":   true,
+}
+
+func validateSystemFilename(filename string) error {
+	if !systemFileAllowlist[filename] {
+		return fmt.Errorf("filename %q is not a supported agent system file", filename)
 	}
 	return nil
 }
