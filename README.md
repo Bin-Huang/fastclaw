@@ -174,6 +174,79 @@ Click an agent to enter its management panel:
 ./fastclaw gateway
 ```
 
+### Local agent instances
+
+For temporary local agents, run isolated gateway instances by name. Each
+instance has its own sqlite database, config, users, agents, workspaces, and
+logs.
+
+```bash
+# Create a local instance and seed its provider/model config.
+fastclaw agents init scratch \
+  --provider openai \
+  --model openai/gpt-4.1 \
+  --api-key-env OPENAI_API_KEY
+
+# Configure runtime settings directly from the CLI.
+fastclaw agents config scratch set sandbox.enabled true
+fastclaw agents config scratch set temperature 0.2
+
+# Customize identity files.
+fastclaw agents files put scratch SOUL.md ./SOUL.md
+fastclaw agents files put scratch IDENTITY.md ./IDENTITY.md
+
+# Run and inspect the instance.
+fastclaw agents start scratch
+fastclaw agents ls
+fastclaw agents log scratch
+fastclaw agents stop scratch
+```
+
+`agents init` writes the local sqlite store directly, so provider/model
+defaults and system files can be configured without opening the dashboard.
+When the local DB has no users, it creates a super admin account. If
+`--password` is omitted, a password is generated and printed once.
+
+Provider presets are available for `openai`, `openrouter`, `anthropic`,
+`ollama`, `groq`, `deepseek`, and `mistral`. Use `--api-key-env` instead of
+placing API keys directly on the command line:
+
+```bash
+fastclaw agents init scratch --provider openai --model openai/gpt-4.1 --api-key-env OPENAI_API_KEY
+fastclaw agents init local-llama --provider ollama --model llama3.1
+```
+
+Configuration can be read or updated by key. Common keys include `model`,
+`temperature`, `maxTokens`, `thinking`, `policy`, `sandbox.enabled`,
+`sandbox.backend`, and provider fields such as `provider.openai.apiBase`,
+`provider.openai.apiType`, and `provider.openai.apiKeyEnv`.
+
+```bash
+fastclaw agents config scratch get
+fastclaw agents config scratch get model
+fastclaw agents config scratch get sandbox
+fastclaw agents config scratch set model openai/gpt-4.1-mini
+fastclaw agents config scratch set provider.openai.apiKeyEnv OPENAI_API_KEY
+fastclaw agents config scratch set sandbox '{"enabled":true,"backend":"docker"}'
+```
+
+System files are stored in the local instance database under the configured
+agent/user scope:
+
+```bash
+fastclaw agents files ls scratch
+fastclaw agents files get scratch SOUL.md
+fastclaw agents files get scratch SOUL.md ./SOUL.md
+fastclaw agents files put scratch SOUL.md ./SOUL.md
+```
+
+Each instance gets its own `FASTCLAW_HOME` under `~/.fastclaw/local-agents/<name>`,
+with process metadata in `~/.fastclaw/agent-runs/` and logs in
+`~/.fastclaw/logs/agents/`. Use `--port` or `--home` on `agents start` when you
+need an explicit port or home directory. CLI config writes do not hot-reload a
+running gateway; restart the instance after `agents init`, `agents config set`,
+or `agents files put` if it is already running.
+
 ### Docker
 ```bash
 cd deploy/docker && ./start.sh

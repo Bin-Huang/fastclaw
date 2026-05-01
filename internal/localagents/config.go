@@ -1,0 +1,687 @@
+package localagents
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/scope"
+	"github.com/fastclaw-ai/fastclaw/internal/store"
+	"github.com/fastclaw-ai/fastclaw/internal/users"
+)
+
+// InitOptions controls direct local agent configuration.
+type InitOptions struct {
+	Home        string
+	Port        int
+	AgentName   string
+	Description string
+
+	Provider  string
+	Model     string
+	APIKeyEnv string
+	APIBase   string
+	APIType   string
+	AuthType  string
+
+	Username    string
+	Email       string
+	Password    string
+	DisplayName string
+
+	SandboxEnabled bool
+	SandboxBackend string
+	SandboxImage   string
+	SandboxNetwork string
+}
+
+// InitResult describes what init created or updated.
+type InitResult struct {
+	Instance          Instance
+	CreatedUser       bool
+	GeneratedPassword string
+	ProviderSaved     bool
+	ModelSaved        bool
+}
+
+// Init creates or updates the sqlite-backed configuration for a local agent.
+func Init(name string, opts InitOptions) (*InitResult, error) {
+	if err := validateName(name); err != nil {
+		return nil, err
+	}
+	p, err := instancePaths(name)
+	if err != nil {
+		return nil, err
+	}
+	existing, _ := loadInstance(p.metaFile)
+	home := opts.Home
+	if home == "" && existing != nil {
+		home = existing.Home
+	}
+	if home == "" {
+		home = p.homeDir
+	}
+	home = expandHome(home)
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return nil, fmt.Errorf("create agent home: %w", err)
+	}
+
+	providerSaved := false
+	modelSaved := false
+	var providerName string
+	var fullModel string
+	var pcfg config.ProviderConfig
+	if opts.Provider != "" || opts.Model != "" {
+		var modelID string
+		providerName, modelID, fullModel, err = normalizeProviderModel(opts.Provider, opts.Model)
+		if err != nil {
+			return nil, err
+		}
+		pcfg, err = providerConfigFromOptions(providerName, modelID, opts)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	st, err := openInstanceStore(home)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	acct, created, generatedPassword, err := ensureAccount(ctx, st, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	agentID := "agt_" + name
+	if existing != nil && existing.AgentID != "" {
+		agentID = existing.AgentID
+	}
+	agentName := opts.AgentName
+	if agentName == "" && existing != nil {
+		agentName = existing.AgentName
+	}
+	if agentName == "" {
+		agentName = name
+	}
+	agentRec := &store.AgentRecord{
+		ID:     agentID,
+		UserID: acct.ID,
+		Name:   agentName,
+	}
+	if opts.Description != "" {
+		agentRec.Config = map[string]interface{}{"description": opts.Description}
+	}
+	if err := st.SaveAgent(ctx, agentRec); err != nil {
+		return nil, err
+	}
+
+	if opts.Provider != "" || opts.Model != "" {
+		if err := scope.SaveProvider(ctx, st, scope.System, "", providerName, pcfg); err != nil {
+			return nil, err
+		}
+		providerSaved = true
+		if fullModel != "" {
+			if err := scope.SaveSetting(ctx, st, scope.System, "", "agents.defaults", map[string]interface{}{"model": fullModel}); err != nil {
+				return nil, err
+			}
+			modelSaved = true
+		}
+	}
+	if opts.SandboxEnabled {
+		data := map[string]interface{}{
+			"enabled": true,
+			"backend": defaultStr(opts.SandboxBackend, "docker"),
+		}
+		if opts.SandboxImage != "" {
+			data["image"] = opts.SandboxImage
+		}
+		if opts.SandboxNetwork != "" {
+			data["network"] = opts.SandboxNetwork
+		}
+		if err := scope.SaveSetting(ctx, st, scope.System, "", "sandbox", data); err != nil {
+			return nil, err
+		}
+	}
+
+	port := opts.Port
+	if port <= 0 && existing != nil {
+		port = existing.Port
+	}
+	inst := &Instance{
+		Name:      name,
+		AgentID:   agentID,
+		AgentName: agentName,
+		UserID:    acct.ID,
+		Port:      port,
+		Home:      home,
+		LogFile:   p.logFile,
+	}
+	if port > 0 {
+		inst.URL = fmt.Sprintf("http://localhost:%d", port)
+	}
+	if existing != nil {
+		inst.PID = existing.PID
+		inst.Command = existing.Command
+		inst.StoppedAt = existing.StoppedAt
+		if inst.StartedAt.IsZero() {
+			inst.StartedAt = existing.StartedAt
+		}
+	}
+	if err := saveInstance(p.metaFile, inst); err != nil {
+		return nil, err
+	}
+	return &InitResult{
+		Instance:          *inst,
+		CreatedUser:       created,
+		GeneratedPassword: generatedPassword,
+		ProviderSaved:     providerSaved,
+		ModelSaved:        modelSaved,
+	}, nil
+}
+
+// SetConfig writes a supported provider or setting key.
+func SetConfig(name, key, rawValue string) error {
+	st, _, err := storeForName(name)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if strings.HasPrefix(key, "provider.") {
+		return setProviderField(ctx, st, key, rawValue)
+	}
+	namespace, path, err := settingKey(key)
+	if err != nil {
+		return err
+	}
+	if len(path) == 0 {
+		obj, ok := parseValue(rawValue).(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("config key %q expects a JSON object value", key)
+		}
+		return scope.SaveSetting(ctx, st, scope.System, "", namespace, obj)
+	}
+	data := map[string]interface{}{}
+	if rec, err := st.GetConfigByName(ctx, store.KindSetting, scope.System, "", namespace); err == nil && rec != nil {
+		data = rec.Data
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	setNested(data, path, parseValue(rawValue))
+	if namespace == "sandbox" && len(path) > 0 && path[0] == "enabled" {
+		if enabled, _ := data["enabled"].(bool); enabled {
+			if _, ok := data["backend"].(string); !ok {
+				data["backend"] = "docker"
+			}
+		}
+	}
+	return scope.SaveSetting(ctx, st, scope.System, "", namespace, data)
+}
+
+// GetConfig returns one config value, or a redacted system config dump when key is empty.
+func GetConfig(name, key string) (interface{}, error) {
+	st, _, err := storeForName(name)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if key == "" {
+		return configDump(ctx, st)
+	}
+	if strings.HasPrefix(key, "provider.") {
+		return getProviderField(ctx, st, key)
+	}
+	namespace, path, err := settingKey(key)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := st.GetConfigByName(ctx, store.KindSetting, scope.System, "", namespace)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(path) == 0 {
+		return rec.Data, nil
+	}
+	return getNested(rec.Data, path), nil
+}
+
+// PutFile writes an agent system file for the configured local agent.
+func PutFile(name, filename, srcPath string) error {
+	data, err := os.ReadFile(srcPath)
+	if err != nil {
+		return err
+	}
+	st, inst, err := storeForName(name)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := ensureConfigured(inst); err != nil {
+		return err
+	}
+	return st.SaveAgentFile(context.Background(), inst.AgentID, inst.UserID, filename, data)
+}
+
+// GetFile reads an agent system file.
+func GetFile(name, filename string) ([]byte, error) {
+	st, inst, err := storeForName(name)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	if err := ensureConfigured(inst); err != nil {
+		return nil, err
+	}
+	return st.GetAgentFile(context.Background(), inst.AgentID, inst.UserID, filename)
+}
+
+// ListFiles lists agent system files stored for the configured local agent.
+func ListFiles(name string) ([]string, error) {
+	st, inst, err := storeForName(name)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	if err := ensureConfigured(inst); err != nil {
+		return nil, err
+	}
+	return st.ListAgentFiles(context.Background(), inst.AgentID, inst.UserID)
+}
+
+func openInstanceStore(home string) (store.Store, error) {
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(prevLogger)
+	return store.New(&store.StorageConfig{
+		Type:        store.StorageSQLite,
+		AutoMigrate: true,
+	}, home)
+}
+
+func storeForName(name string) (store.Store, *Instance, error) {
+	if err := validateName(name); err != nil {
+		return nil, nil, err
+	}
+	p, err := instancePaths(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	inst, err := loadInstance(p.metaFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("agent %q is not initialized; run `fastclaw agents init %s` first", name, name)
+	}
+	if inst.Home == "" {
+		inst.Home = p.homeDir
+	}
+	st, err := openInstanceStore(inst.Home)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, inst, nil
+}
+
+func ensureAccount(ctx context.Context, st store.Store, opts InitOptions) (*users.Account, bool, string, error) {
+	accts, err := users.NewAccounts(st)
+	if err != nil {
+		return nil, false, "", err
+	}
+	if opts.Username != "" {
+		if rec, err := st.GetUserByLogin(ctx, opts.Username); err == nil {
+			acct, err := accts.Get(ctx, rec.ID)
+			return acct, false, "", err
+		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, false, "", err
+		}
+	}
+	n, err := st.CountUsers(ctx)
+	if err != nil {
+		return nil, false, "", err
+	}
+	if n > 0 {
+		usersList, err := accts.List(ctx)
+		if err != nil {
+			return nil, false, "", err
+		}
+		if len(usersList) == 0 {
+			return nil, false, "", errors.New("users list is empty despite nonzero count")
+		}
+		for _, acct := range usersList {
+			if acct.Role == users.RoleSuperAdmin {
+				return acct, false, "", nil
+			}
+		}
+		return usersList[0], false, "", nil
+	}
+
+	username := defaultStr(opts.Username, "admin")
+	email := defaultStr(opts.Email, "admin@local.fastclaw")
+	password := opts.Password
+	generated := ""
+	if password == "" {
+		var err error
+		password, err = randomPassword()
+		if err != nil {
+			return nil, false, "", err
+		}
+		generated = password
+	}
+	acct, err := accts.Create(ctx, username, email, password, opts.DisplayName, users.RoleSuperAdmin)
+	return acct, err == nil, generated, err
+}
+
+func normalizeProviderModel(providerName, model string) (string, string, string, error) {
+	providerName = strings.TrimSpace(providerName)
+	model = strings.TrimSpace(model)
+	modelID := model
+	if strings.Contains(model, "/") {
+		parts := strings.SplitN(model, "/", 2)
+		if providerName == "" {
+			providerName = parts[0]
+		}
+		modelID = parts[1]
+	}
+	if providerName == "" {
+		return "", "", "", errors.New("--provider is required when --model does not include a provider prefix")
+	}
+	fullModel := ""
+	if modelID != "" {
+		fullModel = providerName + "/" + modelID
+	}
+	return providerName, modelID, fullModel, nil
+}
+
+func providerConfigFromOptions(providerName, modelID string, opts InitOptions) (config.ProviderConfig, error) {
+	preset := providerPreset(providerName)
+	apiBase := defaultStr(opts.APIBase, preset.apiBase)
+	apiType := defaultStr(opts.APIType, preset.apiType)
+	authType := defaultStr(opts.AuthType, preset.authType)
+	apiKeyEnv := opts.APIKeyEnv
+	if apiKeyEnv == "" {
+		apiKeyEnv = preset.apiKeyEnv
+	}
+	apiKey := ""
+	if apiKeyEnv != "" {
+		apiKey = os.Getenv(apiKeyEnv)
+		if apiKey == "" && providerName != "ollama" {
+			return config.ProviderConfig{}, fmt.Errorf("environment variable %s is empty", apiKeyEnv)
+		}
+	}
+	if apiKey == "" && providerName == "ollama" {
+		apiKey = "ollama"
+	}
+	cfg := config.ProviderConfig{
+		APIKey:   apiKey,
+		APIBase:  apiBase,
+		APIType:  apiType,
+		AuthType: authType,
+	}
+	if modelID != "" {
+		cfg.Models = []config.ModelEntry{{ID: modelID, Name: modelID}}
+	}
+	return cfg, nil
+}
+
+type providerDefaults struct {
+	apiBase   string
+	apiType   string
+	authType  string
+	apiKeyEnv string
+}
+
+func providerPreset(name string) providerDefaults {
+	switch strings.ToLower(name) {
+	case "anthropic":
+		return providerDefaults{"https://api.anthropic.com", "anthropic-messages", "api-key", "ANTHROPIC_API_KEY"}
+	case "openrouter":
+		return providerDefaults{"https://openrouter.ai/api/v1", "openai-chat", "bearer-token", "OPENROUTER_API_KEY"}
+	case "ollama":
+		return providerDefaults{"http://localhost:11434/v1", "openai-chat", "bearer-token", ""}
+	case "groq":
+		return providerDefaults{"https://api.groq.com/openai/v1", "openai-chat", "bearer-token", "GROQ_API_KEY"}
+	case "deepseek":
+		return providerDefaults{"https://api.deepseek.com/v1", "openai-chat", "bearer-token", "DEEPSEEK_API_KEY"}
+	case "mistral":
+		return providerDefaults{"https://api.mistral.ai/v1", "openai-chat", "bearer-token", "MISTRAL_API_KEY"}
+	case "openai":
+		fallthrough
+	default:
+		return providerDefaults{"https://api.openai.com/v1", "openai-chat", "bearer-token", "OPENAI_API_KEY"}
+	}
+}
+
+func setProviderField(ctx context.Context, st store.Store, key, rawValue string) error {
+	parts := strings.Split(strings.TrimPrefix(key, "provider."), ".")
+	if len(parts) != 2 {
+		return errors.New("provider config key must look like provider.<name>.<field>")
+	}
+	name, field := parts[0], parts[1]
+	pc := config.ProviderConfig{}
+	if rec, err := st.GetConfigByName(ctx, store.KindProvider, scope.System, "", name); err == nil && rec != nil {
+		blob, _ := json.Marshal(rec.Data)
+		_ = json.Unmarshal(blob, &pc)
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	switch field {
+	case "apiKeyEnv":
+		pc.APIKey = os.Getenv(rawValue)
+		if pc.APIKey == "" {
+			return fmt.Errorf("environment variable %s is empty", rawValue)
+		}
+	case "apiKey":
+		pc.APIKey = rawValue
+	case "apiBase":
+		pc.APIBase = rawValue
+	case "apiType":
+		pc.APIType = rawValue
+	case "authType":
+		pc.AuthType = rawValue
+	case "model":
+		if rawValue == "" {
+			pc.Models = nil
+			break
+		}
+		pc.Models = appendModel(pc.Models, rawValue)
+	default:
+		return fmt.Errorf("unsupported provider field %q", field)
+	}
+	return scope.SaveProvider(ctx, st, scope.System, "", name, pc)
+}
+
+func getProviderField(ctx context.Context, st store.Store, key string) (interface{}, error) {
+	parts := strings.Split(strings.TrimPrefix(key, "provider."), ".")
+	if len(parts) != 2 {
+		return nil, errors.New("provider config key must look like provider.<name>.<field>")
+	}
+	rec, err := st.GetConfigByName(ctx, store.KindProvider, scope.System, "", parts[0])
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	data := redactProviderData(rec.Data)
+	return data[parts[1]], nil
+}
+
+func appendModel(models []config.ModelEntry, id string) []config.ModelEntry {
+	for _, m := range models {
+		if m.ID == id {
+			return models
+		}
+	}
+	return append(models, config.ModelEntry{ID: id, Name: id})
+}
+
+var knownSettingNamespaces = []string{
+	"agents.defaults",
+	"skills.install",
+	"skills.entries",
+	"tools.providers",
+	"tools.categories",
+	"skillsLearner",
+	"objectstore",
+	"taskqueue",
+	"sandbox",
+	"heartbeat",
+	"plugins",
+	"memory",
+	"privacy",
+	"hooks",
+	"teams",
+	"bindings",
+}
+
+func settingKey(key string) (string, []string, error) {
+	switch key {
+	case "model":
+		return "agents.defaults", []string{"model"}, nil
+	case "maxTokens":
+		return "agents.defaults", []string{"maxTokens"}, nil
+	case "temperature":
+		return "agents.defaults", []string{"temperature"}, nil
+	case "thinking":
+		return "agents.defaults", []string{"thinking"}, nil
+	case "policy":
+		return "agents.defaults", []string{"policy"}, nil
+	}
+	for _, ns := range knownSettingNamespaces {
+		if key == ns {
+			return ns, nil, nil
+		}
+		prefix := ns + "."
+		if strings.HasPrefix(key, prefix) {
+			path := strings.Split(strings.TrimPrefix(key, prefix), ".")
+			if len(path) == 0 || path[0] == "" {
+				break
+			}
+			return ns, path, nil
+		}
+	}
+	return "", nil, fmt.Errorf("unsupported config key %q", key)
+}
+
+func configDump(ctx context.Context, st store.Store) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	settings, err := st.ListConfigs(ctx, store.KindSetting, scope.System, "")
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range settings {
+		out[rec.Name] = rec.Data
+	}
+	providers, err := st.ListConfigs(ctx, store.KindProvider, scope.System, "")
+	if err != nil {
+		return nil, err
+	}
+	provOut := map[string]interface{}{}
+	for _, rec := range providers {
+		provOut[rec.Name] = redactProviderData(rec.Data)
+	}
+	if len(provOut) > 0 {
+		out["providers"] = provOut
+	}
+	agents, err := st.ListAllAgents(ctx)
+	if err == nil && len(agents) > 0 {
+		sort.Slice(agents, func(i, j int) bool { return agents[i].Name < agents[j].Name })
+		out["agents"] = agents
+	}
+	return out, nil
+}
+
+func redactProviderData(data map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(data))
+	for k, v := range data {
+		if k == "apiKey" {
+			if s, _ := v.(string); s != "" {
+				out[k] = "<set>"
+			} else {
+				out[k] = ""
+			}
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func setNested(data map[string]interface{}, path []string, value interface{}) {
+	cur := data
+	for _, p := range path[:len(path)-1] {
+		next, _ := cur[p].(map[string]interface{})
+		if next == nil {
+			next = map[string]interface{}{}
+			cur[p] = next
+		}
+		cur = next
+	}
+	cur[path[len(path)-1]] = value
+}
+
+func getNested(data map[string]interface{}, path []string) interface{} {
+	var cur interface{} = data
+	for _, p := range path {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		cur = m[p]
+	}
+	return cur
+}
+
+func parseValue(raw string) interface{} {
+	var v interface{}
+	if err := json.Unmarshal([]byte(raw), &v); err == nil {
+		return v
+	}
+	if b, err := strconv.ParseBool(raw); err == nil {
+		return b
+	}
+	if i, err := strconv.Atoi(raw); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f
+	}
+	return raw
+}
+
+func ensureConfigured(inst *Instance) error {
+	if inst == nil || inst.AgentID == "" || inst.UserID == "" {
+		return errors.New("agent is not initialized; run `fastclaw agents init <name>` first")
+	}
+	return nil
+}
+
+func randomPassword() (string, error) {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func defaultStr(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
