@@ -264,6 +264,26 @@ need an explicit port or home directory. CLI config writes do not hot-reload a
 running gateway; use `agents restart <name>` after `agents init`, `agents
 config set`, or `agents files put` if the instance is already running.
 
+A few sharp edges worth knowing:
+
+- `agents start <name>` does not require `agents init` first. A bare `start`
+  boots a gateway with an empty database; the web setup wizard at the printed
+  URL will walk you through provider/admin configuration.
+- `agents rm` keeps `~/.fastclaw/local-agents/<name>/` and the log file by
+  default so a later `agents init <name>` can recover prior data. Pass
+  `--purge` to wipe them too. `--force` only stops a running agent before
+  removal — it does not imply `--purge`.
+- On Unix, `agents stop` SIGTERMs the whole gateway process group (sandbox
+  runners, plugin subprocesses, etc.) and escalates to SIGKILL after 5
+  seconds. On Windows, the gateway is detached with `CREATE_NEW_PROCESS_GROUP`
+  and `agents stop` sends `CTRL_BREAK_EVENT`, falling back to a hard kill if
+  the gateway does not handle it.
+- `agents init` reuse rules: re-running against the same `<name>` preserves
+  the agent record's `Config` map, system files, existing model entry
+  metadata, and provider fields not explicitly overridden. The agent is
+  bound to the existing owner — passing `--username` for a different
+  account refuses rather than silently rebinding.
+
 | Subcommand | Purpose |
 |---|---|
 | `agents init <name>` | Create or update an instance's sqlite config (provider, model, sandbox, admin user) |

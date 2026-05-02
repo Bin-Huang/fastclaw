@@ -107,6 +107,12 @@ func agentsInitCmd() *cobra.Command {
 			if res.ModelSaved {
 				fmt.Println("Model:    saved")
 			}
+			if !res.ModelSaved {
+				if model, _ := localagents.GetConfig(args[0], "model"); model == nil || model == "" {
+					fmt.Fprintln(os.Stderr, "Hint: no model is configured. Set one with:")
+					fmt.Fprintf(os.Stderr, "  fastclaw agents config %s set model <provider>/<model>\n", args[0])
+				}
+			}
 			if res.CreatedUser && res.GeneratedPassword != "" {
 				fmt.Printf("Generated admin password: %s\n", res.GeneratedPassword)
 			}

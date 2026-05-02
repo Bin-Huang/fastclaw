@@ -457,6 +457,88 @@ func TestRemoveAgentRefusesRunningWithoutForce(t *testing.T) {
 	}
 }
 
+func TestInitRefusesUserSwitchOnExistingAgent(t *testing.T) {
+	setupTestHome(t)
+
+	if _, err := Init("scratch", InitOptions{Username: "alice"}); err != nil {
+		t.Fatalf("seed alice: %v", err)
+	}
+	// Manually create a second user. Init resolves --username to that user
+	// and would re-save the agent record under a new owner if we let it.
+	st, _, err := storeForName("scratch")
+	if err != nil {
+		t.Fatalf("storeForName: %v", err)
+	}
+	accts, err := users.NewAccounts(st)
+	if err != nil {
+		t.Fatalf("accounts: %v", err)
+	}
+	bob, err := accts.Create(context.Background(), "bob", "bob@local", "secret-bob", "Bob", users.RoleUser)
+	if err != nil {
+		st.Close()
+		t.Fatalf("create bob: %v", err)
+	}
+	st.Close()
+
+	_, err = Init("scratch", InitOptions{Username: "bob"})
+	if err == nil || !strings.Contains(err.Error(), "is owned by user") {
+		t.Fatalf("expected refusal to rebind, got %v", err)
+	}
+
+	// Without --username the existing owner must be preserved (not
+	// silently rebound to whichever super-admin we land on).
+	res, err := Init("scratch", InitOptions{})
+	if err != nil {
+		t.Fatalf("re-init without username: %v", err)
+	}
+	if res.Instance.UserID == bob.ID {
+		t.Fatalf("re-init silently rebound owner to bob")
+	}
+}
+
+func TestSetProviderModelRejectsEmptyValue(t *testing.T) {
+	setupTestHome(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+
+	if _, err := Init("scratch", InitOptions{
+		Provider:  "openai",
+		Model:     "openai/gpt-4.1",
+		APIKeyEnv: "OPENAI_API_KEY",
+	}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	if err := SetConfig("scratch", "provider.openai.model", ""); err == nil {
+		t.Fatal("empty model id must be rejected, not silently wipe the list")
+	}
+	if got := loadProviderModelCount(t, "scratch", "openai"); got == 0 {
+		t.Fatal("models list was wiped despite the rejection")
+	}
+
+	// Explicit clear is allowed via the plural key with [].
+	if err := SetConfig("scratch", "provider.openai.models", "[]"); err != nil {
+		t.Fatalf("explicit clear: %v", err)
+	}
+	if got := loadProviderModelCount(t, "scratch", "openai"); got != 0 {
+		t.Fatalf("expected models cleared, still have %d", got)
+	}
+}
+
+func loadProviderModelCount(t *testing.T, name, provider string) int {
+	t.Helper()
+	st, _, err := storeForName(name)
+	if err != nil {
+		t.Fatalf("storeForName: %v", err)
+	}
+	defer st.Close()
+	rec, err := st.GetConfigByName(context.Background(), store.KindProvider, scope.System, "", provider)
+	if err != nil {
+		t.Fatalf("get provider %q: %v", provider, err)
+	}
+	models, _ := rec.Data["models"].([]interface{})
+	return len(models)
+}
+
 func TestCorruptMetadataIsNotOverwritten(t *testing.T) {
 	setupTestHome(t)
 	p, err := instancePaths("scratch")

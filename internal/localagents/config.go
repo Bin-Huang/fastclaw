@@ -125,14 +125,27 @@ func Init(name string, opts InitOptions) (*InitResult, error) {
 		agentName = name
 	}
 	agentConfig := map[string]interface{}{}
-	if rec, err := st.GetAgent(ctx, agentID); err == nil && rec != nil && rec.Config != nil {
-		agentConfig = rec.Config
+	ownerID := acct.ID
+	if rec, err := st.GetAgent(ctx, agentID); err == nil && rec != nil {
+		if rec.Config != nil {
+			agentConfig = rec.Config
+		}
+		// Re-init must not silently rebind an agent record onto a
+		// different user. Honour an explicit --username switch (which
+		// sets opts.Username) but otherwise keep the existing owner.
+		if rec.UserID != "" && rec.UserID != acct.ID {
+			if opts.Username == "" {
+				ownerID = rec.UserID
+			} else {
+				return nil, fmt.Errorf("agent %q is owned by user %s; pass --username matching that account or remove the agent first", name, rec.UserID)
+			}
+		}
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
 	agentRec := &store.AgentRecord{
 		ID:     agentID,
-		UserID: acct.ID,
+		UserID: ownerID,
 		Name:   agentName,
 		Config: agentConfig,
 	}
@@ -185,7 +198,7 @@ func Init(name string, opts InitOptions) (*InitResult, error) {
 		Name:      name,
 		AgentID:   agentID,
 		AgentName: agentName,
-		UserID:    acct.ID,
+		UserID:    ownerID,
 		Port:      port,
 		Home:      home,
 		LogFile:   p.logFile,
@@ -565,10 +578,15 @@ func setProviderField(ctx context.Context, st store.Store, key, rawValue string)
 		pc.AuthType = rawValue
 	case "model":
 		if rawValue == "" {
-			pc.Models = nil
-			break
+			return errors.New("provider model id is required; pass `provider.<name>.models` (note the s) with an empty array to clear the list")
 		}
 		pc.Models = appendModel(pc.Models, rawValue)
+	case "models":
+		if rawValue == "[]" {
+			pc.Models = nil
+		} else {
+			return errors.New(`only "[]" is accepted for provider.<name>.models — use provider.<name>.model <id> to add entries`)
+		}
 	default:
 		return fmt.Errorf("unsupported provider field %q", field)
 	}
