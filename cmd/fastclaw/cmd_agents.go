@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,14 +21,31 @@ func agentsCmd() *cobra.Command {
 		Use:   "agents",
 		Short: "Manage local FastClaw agent instances",
 	}
-	cmd.AddCommand(agentsListCmd())
-	cmd.AddCommand(agentsInitCmd())
-	cmd.AddCommand(agentsStartCmd())
-	cmd.AddCommand(agentsStopCmd())
-	cmd.AddCommand(agentsLogCmd())
-	cmd.AddCommand(agentsConfigCmd())
-	cmd.AddCommand(agentsFilesCmd())
+	addAgentsSubcommand(cmd, agentsListCmd())
+	addAgentsSubcommand(cmd, agentsInitCmd())
+	addAgentsSubcommand(cmd, agentsStartCmd())
+	addAgentsSubcommand(cmd, agentsStopCmd())
+	addAgentsSubcommand(cmd, agentsRestartCmd())
+	addAgentsSubcommand(cmd, agentsRemoveCmd())
+	addAgentsSubcommand(cmd, agentsStatusCmd())
+	addAgentsSubcommand(cmd, agentsLogCmd())
+	addAgentsSubcommand(cmd, agentsConfigCmd())
+	addAgentsSubcommand(cmd, agentsFilesCmd())
 	return cmd
+}
+
+// addAgentsSubcommand attaches a subcommand and silences cobra's usage dump
+// on every error throughout the agents tree (we keep error printing on).
+func addAgentsSubcommand(parent, child *cobra.Command) {
+	silenceTree(child)
+	parent.AddCommand(child)
+}
+
+func silenceTree(cmd *cobra.Command) {
+	cmd.SilenceUsage = true
+	for _, sub := range cmd.Commands() {
+		silenceTree(sub)
+	}
 }
 
 func agentsListCmd() *cobra.Command {
@@ -158,6 +178,112 @@ func agentsStopCmd() *cobra.Command {
 	}
 }
 
+func agentsRestartCmd() *cobra.Command {
+	var port int
+	var home string
+	cmd := &cobra.Command{
+		Use:   "restart <name>",
+		Short: "Stop and start a local agent instance",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			st, err := localagents.GetStatus(name)
+			if err != nil {
+				return err
+			}
+			if st.Running {
+				if _, err := localagents.Stop(name); err != nil {
+					return err
+				}
+			}
+			inst, err := localagents.Start(name, localagents.StartOptions{Port: port, Home: home})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Agent %q restarted (PID %d)\n", inst.Name, inst.PID)
+			fmt.Printf("URL:  %s\n", inst.URL)
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&port, "port", 0, "override port on restart (default: reuse previous)")
+	cmd.Flags().StringVar(&home, "home", "", "override FASTCLAW_HOME on restart (default: reuse previous)")
+	return cmd
+}
+
+func agentsRemoveCmd() *cobra.Command {
+	var force, purge bool
+	cmd := &cobra.Command{
+		Use:     "rm <name>",
+		Aliases: []string{"remove"},
+		Short:   "Remove a local agent instance",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			inst, err := localagents.Remove(args[0], localagents.RemoveOptions{
+				Force: force,
+				Purge: purge,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Agent %q removed\n", inst.Name)
+			if !purge && inst.Home != "" {
+				fmt.Printf("Home preserved: %s\n", inst.Home)
+				fmt.Printf("Log preserved:  %s\n", inst.LogFile)
+				fmt.Println("Pass --purge to delete them too.")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "stop the agent first if it is still running")
+	cmd.Flags().BoolVar(&purge, "purge", false, "also delete the agent's home directory and log file")
+	return cmd
+}
+
+func agentsStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status <name>",
+		Short: "Show status for a single local agent instance",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st, err := localagents.GetStatus(args[0])
+			if err != nil {
+				return err
+			}
+			running := "stopped"
+			if st.Running {
+				running = "running"
+			}
+			fmt.Printf("Name:    %s\n", st.Name)
+			fmt.Printf("Status:  %s\n", running)
+			if st.AgentID != "" {
+				fmt.Printf("AgentID: %s\n", st.AgentID)
+			}
+			if st.UserID != "" {
+				fmt.Printf("UserID:  %s\n", st.UserID)
+			}
+			if st.PID > 0 {
+				fmt.Printf("PID:     %d\n", st.PID)
+			}
+			if st.Port > 0 {
+				fmt.Printf("Port:    %d\n", st.Port)
+			}
+			if st.URL != "" {
+				fmt.Printf("URL:     %s\n", st.URL)
+			}
+			if st.Home != "" {
+				fmt.Printf("Home:    %s\n", st.Home)
+			}
+			if st.LogFile != "" {
+				fmt.Printf("Log:     %s\n", st.LogFile)
+			}
+			if st.Running && !st.StartedAt.IsZero() {
+				fmt.Printf("Uptime:  %s\n", st.Uptime.Round(time.Second))
+			}
+			return nil
+		},
+	}
+}
+
 func agentsConfigCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "config <name> <get|set> [key] [value]",
@@ -266,24 +392,124 @@ func agentsLogCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if _, err := os.Stat(logFile); os.IsNotExist(err) {
-				return fmt.Errorf("no log file found at %s", logFile)
-			}
-			tailArgs := []string{"-n", fmt.Sprintf("%d", lines)}
-			if follow {
-				tailArgs = append(tailArgs, "-f")
-			}
-			tailArgs = append(tailArgs, logFile)
-
-			tailCmd := exec.Command("tail", tailArgs...)
-			tailCmd.Stdout = os.Stdout
-			tailCmd.Stderr = os.Stderr
-			return tailCmd.Run()
+			return tailLog(logFile, lines, follow, os.Stdout)
 		},
 	}
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow log output")
 	cmd.Flags().IntVarP(&lines, "lines", "n", 50, "Number of lines to show")
 	return cmd
+}
+
+// tailLog mirrors `tail -n LINES [-f] PATH` without depending on a system
+// `tail` binary, so the command works on Windows too.
+func tailLog(path string, lines int, follow bool, out io.Writer) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("no log file found at %s", path)
+		}
+		return err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	start, err := lastNLineOffset(f, fi.Size(), lines)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, f); err != nil {
+		return err
+	}
+	if !follow {
+		return nil
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	pos, _ := f.Seek(0, io.SeekCurrent)
+	buf := make([]byte, 32*1024)
+	for {
+		select {
+		case <-sigCh:
+			return nil
+		case <-ticker.C:
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if fi.Size() < pos {
+			// Log was truncated/rotated. Reopen and resume from the start.
+			f.Close()
+			f, err = os.Open(path)
+			if err != nil {
+				return err
+			}
+			pos = 0
+		}
+		for {
+			n, err := f.Read(buf)
+			if n > 0 {
+				if _, werr := out.Write(buf[:n]); werr != nil {
+					return werr
+				}
+				pos += int64(n)
+			}
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// lastNLineOffset returns the byte offset where the last `n` lines of the
+// file begin. Reads backward in 8KiB chunks until n newlines are found.
+func lastNLineOffset(f *os.File, size int64, n int) (int64, error) {
+	if n <= 0 || size == 0 {
+		return size, nil
+	}
+	const chunk = 8192
+	buf := make([]byte, chunk)
+	pos := size
+	count := 0
+	for pos > 0 {
+		readSize := int64(chunk)
+		if pos < readSize {
+			readSize = pos
+		}
+		pos -= readSize
+		if _, err := f.ReadAt(buf[:readSize], pos); err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		for i := readSize - 1; i >= 0; i-- {
+			if buf[i] != '\n' {
+				continue
+			}
+			// The trailing newline at end-of-file does not count as a
+			// line boundary that hides a preceding line.
+			if pos+i+1 == size {
+				continue
+			}
+			count++
+			if count >= n {
+				return pos + i + 1, nil
+			}
+		}
+	}
+	return 0, nil
 }
 
 func printValue(value interface{}) error {

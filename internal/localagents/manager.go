@@ -217,6 +217,51 @@ func Stop(name string) (*Instance, error) {
 	return inst, nil
 }
 
+// RemoveOptions controls how local agent state is reclaimed.
+type RemoveOptions struct {
+	// Force stops the agent first if it is still running.
+	Force bool
+	// Purge also removes the agent's FASTCLAW_HOME directory (sqlite DB and all).
+	Purge bool
+}
+
+// Remove deletes persisted state for a local agent instance. By default it
+// keeps the agent's home directory and log file untouched so a later
+// `agents init <name>` can recover prior data; pass Purge to wipe them.
+func Remove(name string, opts RemoveOptions) (*Instance, error) {
+	if err := validateName(name); err != nil {
+		return nil, err
+	}
+	p, err := instancePaths(name)
+	if err != nil {
+		return nil, err
+	}
+	inst, err := loadInstance(p.metaFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("agent %q is not known", name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if isProcessAlive(inst.PID) {
+		if !opts.Force {
+			return inst, fmt.Errorf("agent %q is running; stop it first or pass --force", name)
+		}
+		if _, err := Stop(name); err != nil {
+			return inst, err
+		}
+	}
+	_ = os.Remove(p.metaFile)
+	_ = os.Remove(p.pidFile)
+	if opts.Purge {
+		_ = os.Remove(p.logFile)
+		if inst.Home != "" {
+			_ = os.RemoveAll(inst.Home)
+		}
+	}
+	return inst, nil
+}
+
 // List returns all known local agent instances.
 func List() ([]Status, error) {
 	base, err := basePaths()

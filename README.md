@@ -198,14 +198,29 @@ fastclaw agents files put scratch IDENTITY.md ./IDENTITY.md
 # Run and inspect the instance.
 fastclaw agents start scratch
 fastclaw agents ls
+fastclaw agents status scratch
 fastclaw agents log scratch
+fastclaw agents log scratch -f -n 200
+fastclaw agents restart scratch
 fastclaw agents stop scratch
+
+# Tear it down. Default keeps the home dir + logs so a later `init` recovers.
+fastclaw agents rm scratch
+fastclaw agents rm scratch --purge   # also wipe ~/.fastclaw/local-agents/scratch and the log file
+fastclaw agents rm scratch --force   # stop the agent first if it is still running
 ```
 
 `agents init` writes the local sqlite store directly, so provider/model
 defaults and system files can be configured without opening the dashboard.
 When the local DB has no users, it creates a super admin account. If
-`--password` is omitted, a password is generated and printed once.
+`--password` is omitted, a password is generated and printed once. When the
+DB already has users, passing `--username` requires that account to exist —
+the command refuses to silently bind the agent to a different user.
+
+Re-running `agents init` against the same name is non-destructive: the agent
+record's `Config` map, the agent system files, and existing model entry
+metadata (context window, max tokens, cost) are preserved. Provider fields
+that are not explicitly overridden also keep their previous values.
 
 Provider presets are available for `openai`, `openrouter`, `anthropic`,
 `ollama`, `groq`, `deepseek`, and `mistral`. Use `--api-key-env` instead of
@@ -246,8 +261,21 @@ Each instance gets its own `FASTCLAW_HOME` under `~/.fastclaw/local-agents/<name
 with process metadata in `~/.fastclaw/agent-runs/` and logs in
 `~/.fastclaw/logs/agents/`. Use `--port` or `--home` on `agents start` when you
 need an explicit port or home directory. CLI config writes do not hot-reload a
-running gateway; restart the instance after `agents init`, `agents config set`,
-or `agents files put` if it is already running.
+running gateway; use `agents restart <name>` after `agents init`, `agents
+config set`, or `agents files put` if the instance is already running.
+
+| Subcommand | Purpose |
+|---|---|
+| `agents init <name>` | Create or update an instance's sqlite config (provider, model, sandbox, admin user) |
+| `agents start <name>` | Launch the gateway as a detached background process |
+| `agents stop <name>` | SIGTERM (then SIGKILL after 5s) the running instance |
+| `agents restart <name>` | Stop (if running) and start, optionally with new `--port` / `--home` |
+| `agents ls` | List all known instances with status/PID/port/uptime |
+| `agents status <name>` | Show one instance's status, URL, log path, uptime |
+| `agents rm <name>` | Remove instance metadata; pass `--purge` to wipe sqlite + logs, `--force` to stop first |
+| `agents log <name> [-f] [-n N]` | Show / follow the instance's log file (no `tail` binary required) |
+| `agents config <name> get\|set [key] [value]` | Read or update saved provider/setting values |
+| `agents files ls\|put\|get <name>` | Read / write the agent's system files (SOUL.md, IDENTITY.md, …) |
 
 ### Docker
 ```bash

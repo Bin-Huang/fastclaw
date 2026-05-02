@@ -92,15 +92,10 @@ func Init(name string, opts InitOptions) (*InitResult, error) {
 	providerSaved := false
 	modelSaved := false
 	var providerName string
+	var modelID string
 	var fullModel string
-	var pcfg config.ProviderConfig
 	if opts.Provider != "" || opts.Model != "" {
-		var modelID string
 		providerName, modelID, fullModel, err = normalizeProviderModel(opts.Provider, opts.Model)
-		if err != nil {
-			return nil, err
-		}
-		pcfg, err = providerConfigFromOptions(providerName, modelID, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -149,6 +144,10 @@ func Init(name string, opts InitOptions) (*InitResult, error) {
 	}
 
 	if opts.Provider != "" || opts.Model != "" {
+		pcfg, err := providerConfigFromOptions(ctx, st, providerName, modelID, opts)
+		if err != nil {
+			return nil, err
+		}
 		if err := scope.SaveProvider(ctx, st, scope.System, "", providerName, pcfg); err != nil {
 			return nil, err
 		}
@@ -380,17 +379,25 @@ func ensureAccount(ctx context.Context, st store.Store, opts InitOptions) (*user
 	if err != nil {
 		return nil, false, "", err
 	}
-	if opts.Username != "" {
-		if rec, err := st.GetUserByLogin(ctx, opts.Username); err == nil {
-			acct, err := accts.Get(ctx, rec.ID)
-			return acct, false, "", err
-		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return nil, false, "", err
-		}
-	}
 	n, err := st.CountUsers(ctx)
 	if err != nil {
 		return nil, false, "", err
+	}
+	if opts.Username != "" {
+		rec, err := st.GetUserByLogin(ctx, opts.Username)
+		if err == nil {
+			acct, err := accts.Get(ctx, rec.ID)
+			return acct, false, "", err
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return nil, false, "", err
+		}
+		// Refusing the silent fallback: when the local DB already has
+		// users, --username pointing at a missing account must fail loudly
+		// instead of bonding the agent to whichever super-admin we find.
+		if n > 0 {
+			return nil, false, "", fmt.Errorf("user %q not found in local database", opts.Username)
+		}
 	}
 	if n > 0 {
 		usersList, err := accts.List(ctx)
@@ -451,17 +458,24 @@ func normalizeProviderModel(providerName, model string) (string, string, string,
 	return providerName, modelID, fullModel, nil
 }
 
-func providerConfigFromOptions(providerName, modelID string, opts InitOptions) (config.ProviderConfig, error) {
+func providerConfigFromOptions(ctx context.Context, st store.Store, providerName, modelID string, opts InitOptions) (config.ProviderConfig, error) {
 	preset := providerPreset(providerName)
-	apiBase := defaultStr(opts.APIBase, preset.apiBase)
-	apiType := defaultStr(opts.APIType, preset.apiType)
-	authType := defaultStr(opts.AuthType, preset.authType)
+	existing := config.ProviderConfig{}
+	if rec, err := st.GetConfigByName(ctx, store.KindProvider, scope.System, "", providerName); err == nil && rec != nil {
+		blob, _ := json.Marshal(rec.Data)
+		_ = json.Unmarshal(blob, &existing)
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return config.ProviderConfig{}, err
+	}
+	apiBase := firstNonEmpty(opts.APIBase, existing.APIBase, preset.apiBase)
+	apiType := firstNonEmpty(opts.APIType, existing.APIType, preset.apiType)
+	authType := firstNonEmpty(opts.AuthType, existing.AuthType, preset.authType)
 	apiKeyEnv := opts.APIKeyEnv
 	if apiKeyEnv == "" {
 		apiKeyEnv = preset.apiKeyEnv
 	}
-	apiKey := ""
-	if apiKeyEnv != "" {
+	apiKey := existing.APIKey
+	if opts.APIKeyEnv != "" || (apiKey == "" && apiKeyEnv != "") {
 		apiKey = os.Getenv(apiKeyEnv)
 		if apiKey == "" && providerName != "ollama" {
 			return config.ProviderConfig{}, fmt.Errorf("environment variable %s is empty", apiKeyEnv)
@@ -475,11 +489,21 @@ func providerConfigFromOptions(providerName, modelID string, opts InitOptions) (
 		APIBase:  apiBase,
 		APIType:  apiType,
 		AuthType: authType,
+		Models:   existing.Models,
 	}
 	if modelID != "" {
-		cfg.Models = []config.ModelEntry{{ID: modelID, Name: modelID}}
+		cfg.Models = appendModel(cfg.Models, modelID)
 	}
 	return cfg, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 type providerDefaults struct {
