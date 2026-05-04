@@ -12,15 +12,19 @@ import { useAgentName } from "@/hooks/use-agent-name";
 // Render a relative offset like "+340ms" / "+1.2s" / "+13s" / "+2m 4s".
 // Anchor is the first message's timestamp; later events are differences
 // from that. We deliberately drop sub-second precision once we cross 10s
-// because anything finer is noise on a multi-turn run.
+// because anything finer is noise on a multi-turn run. Negative values
+// (which shouldn't happen but can if timestamps got out of order) keep
+// their sign so the data oddity is visible rather than masked.
 function formatOffset(ms: number): string {
-  if (ms <= 0) return "0";
-  if (ms < 1000) return `+${ms}ms`;
-  if (ms < 10_000) return `+${(ms / 1000).toFixed(1)}s`;
-  if (ms < 60_000) return `+${Math.round(ms / 1000)}s`;
-  const mins = Math.floor(ms / 60_000);
-  const secs = Math.round((ms % 60_000) / 1000);
-  return `+${mins}m ${secs}s`;
+  if (ms === 0) return "+0ms";
+  const sign = ms > 0 ? "+" : "-";
+  const abs = Math.abs(ms);
+  if (abs < 1000) return `${sign}${abs}ms`;
+  if (abs < 10_000) return `${sign}${(abs / 1000).toFixed(1)}s`;
+  if (abs < 60_000) return `${sign}${Math.round(abs / 1000)}s`;
+  const mins = Math.floor(abs / 60_000);
+  const secs = Math.round((abs % 60_000) / 1000);
+  return `${sign}${mins}m ${secs}s`;
 }
 
 function formatAbsolute(ms?: number): string {
@@ -127,10 +131,18 @@ function TracePageInner({ params }: PageProps) {
 
   // Pair tool-role messages with the assistant's tool_call by id so the
   // result lands inside the same row instead of dangling below as a
-  // detached "tool" event the way the raw JSONL reads.
+  // detached "tool" event the way the raw JSONL reads. We also track
+  // which tool_call ids an assistant message actually claims, so tool
+  // results whose parent is missing (truncated session, edited history,
+  // legacy data) can still surface as standalone rows instead of
+  // silently disappearing — that's worse than the chat view.
   const resolvedToolResults = new Map<string, { name?: string; content: string; ts?: number }>();
+  const claimedToolCallIds = new Set<string>();
   if (trace) {
     for (const m of trace) {
+      if (m.role === "assistant" && m.toolCalls) {
+        for (const tc of m.toolCalls) claimedToolCallIds.add(tc.id);
+      }
       if (m.role === "tool" && m.toolCallId) {
         resolvedToolResults.set(m.toolCallId, {
           name: m.name,
@@ -184,13 +196,44 @@ function TracePageInner({ params }: PageProps) {
       {trace && trace.length > 0 && (
         <div className="relative space-y-6 border-l border-border ml-4 pl-0">
           {trace.map((m, idx) => {
-            // Tool-role messages render inside their assistant parent; skip
-            // them at the top level so we don't double-render.
-            if (m.role === "tool") return null;
+            // Skip tool-role messages whose parent assistant is in the
+            // trace — they render nested inside that row. Orphans (no
+            // claiming parent) fall through and render as standalone
+            // rows so corrupt / truncated sessions don't lose data.
+            if (m.role === "tool" && m.toolCallId && claimedToolCallIds.has(m.toolCallId)) {
+              return null;
+            }
 
             const ts = m.timestamp || 0;
             const offset = anchorTs && ts ? formatOffset(ts - anchorTs) : `#${idx + 1}`;
             const absolute = formatAbsolute(ts);
+
+            if (m.role === "tool") {
+              return (
+                <RowShell
+                  key={idx}
+                  icon={<Wrench className="size-3.5" />}
+                  iconBg="bg-amber-500"
+                  title={
+                    <span className="flex items-center gap-2">
+                      Tool result
+                      <Badge variant="outline" className="text-[10px]">
+                        orphan
+                      </Badge>
+                    </span>
+                  }
+                  offset={offset}
+                  absolute={absolute}
+                >
+                  <div className="rounded-md border bg-muted/20 p-3 space-y-1">
+                    <div className="text-xs text-muted-foreground font-mono">
+                      {m.name || m.toolCallId || "(unknown tool)"}
+                    </div>
+                    <CollapsibleBlock label="result" body={m.content || ""} />
+                  </div>
+                </RowShell>
+              );
+            }
 
             if (m.role === "user") {
               return (
