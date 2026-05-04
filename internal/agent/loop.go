@@ -476,6 +476,77 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 	return history
 }
 
+// WebChatTrace is the richer sibling of WebChatHistory used by the trace
+// viewer: returns the same per-message shape but also surfaces fields the
+// chat UI hides — `timestamp` (ms since epoch, when the message landed in
+// the session log) and `thinking` (the model's pre-tool-call reasoning).
+// Callers that want to render a turn-by-turn timeline read these to draw
+// relative-time gaps and folding "thinking" panels.
+func (a *Agent) WebChatTrace(sessionId string) []map[string]any {
+	if sessionId == "" {
+		sessionId = "web-ui"
+	}
+	sess := a.sessions.Get("web", sessionId)
+	msgs := sess.GetMessages()
+	var trace []map[string]any
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			text := m.TextContent()
+			var imageURLs []string
+			for _, p := range m.ContentParts {
+				if p.Type == "image_url" && p.ImageURL != nil && p.ImageURL.URL != "" {
+					imageURLs = append(imageURLs, p.ImageURL.URL)
+				}
+			}
+			if text == "" && len(imageURLs) == 0 {
+				continue
+			}
+			entry := map[string]any{"role": "user", "content": text, "timestamp": m.Timestamp}
+			if len(imageURLs) > 0 {
+				entry["imageUrls"] = imageURLs
+			}
+			trace = append(trace, entry)
+		case "assistant":
+			entry := map[string]any{"role": "assistant", "timestamp": m.Timestamp}
+			if m.Content != "" {
+				entry["content"] = m.Content
+			}
+			if m.Thinking != "" {
+				entry["thinking"] = m.Thinking
+			}
+			if len(m.ToolCalls) > 0 {
+				var calls []map[string]string
+				for _, tc := range m.ToolCalls {
+					calls = append(calls, map[string]string{
+						"id":        tc.ID,
+						"name":      tc.Function.Name,
+						"arguments": tc.Function.Arguments,
+					})
+				}
+				entry["toolCalls"] = calls
+			}
+			if m.Content == "" && m.Thinking == "" && len(m.ToolCalls) == 0 {
+				continue
+			}
+			trace = append(trace, entry)
+		case "tool":
+			entry := map[string]any{
+				"role":       "tool",
+				"content":    m.Content,
+				"name":       m.Name,
+				"toolCallId": m.ToolCallID,
+				"timestamp":  m.Timestamp,
+			}
+			if len(m.Metadata) > 0 {
+				entry["metadata"] = m.Metadata
+			}
+			trace = append(trace, entry)
+		}
+	}
+	return trace
+}
+
 // WebChatSessions returns a list of web chat sessions with metadata.
 func (a *Agent) WebChatSessions() []session.WebSession {
 	return a.sessions.ListWebSessions()

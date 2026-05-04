@@ -28,6 +28,7 @@ type AgentHandle interface {
 	HandleWebChat(ctx context.Context, sessionId, text string) string
 	HandleWebChatStream(ctx context.Context, sessionId, text string, imageURLs []string, events chan<- agent.ChatEvent) string
 	WebChatHistory(sessionId string) []map[string]any
+	WebChatTrace(sessionId string) []map[string]any
 	WebChatSessions() []session.WebSession
 	DeleteWebChatSession(sessionId string) error
 	RenameWebChatSession(sessionId, title string) error
@@ -174,6 +175,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/chat", auth(s.handleChat))
 	mux.HandleFunc("POST /api/chat/stream", auth(s.handleChatStream))
 	mux.HandleFunc("GET /api/chat/history", auth(s.handleChatHistory))
+	mux.HandleFunc("GET /api/chat/trace", auth(s.handleChatTrace))
 	mux.HandleFunc("GET /api/chat/sessions", auth(s.handleChatSessions))
 	mux.HandleFunc("PUT /api/chat/sessions/{key}", auth(s.handleRenameSession))
 	mux.HandleFunc("DELETE /api/chat/sessions/{key}", auth(s.handleDeleteSession))

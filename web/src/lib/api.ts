@@ -559,6 +559,24 @@ export async function getChatHistory(agentId: string, sessionId: string): Promis
   return Array.isArray(data) ? data : [];
 }
 
+// TraceMessage is the richer shape returned by /api/chat/trace — same as
+// ChatHistoryMessage but with `timestamp` (ms) and assistant `thinking`
+// surfaced so the trace viewer can render relative-time gaps and folding
+// reasoning panels. The chat page keeps using getChatHistory which omits
+// these fields.
+export interface TraceMessage extends ChatHistoryMessage {
+  timestamp?: number;
+  thinking?: string;
+}
+
+export async function getChatTrace(agentId: string, sessionId: string): Promise<TraceMessage[]> {
+  const res = await apiFetch(`/api/chat/trace?agentId=${encodeURIComponent(agentId)}&sessionId=${encodeURIComponent(sessionId)}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  if (Array.isArray(data?.trace)) return data.trace;
+  return Array.isArray(data) ? data : [];
+}
+
 export async function getChatSessions(agentId: string): Promise<{ id: string; title?: string; preview: string; thumbnailUrl?: string; createdAt?: number; updatedAt?: number }[]> {
   const res = await apiFetch(`/api/chat/sessions?agentId=${encodeURIComponent(agentId)}`);
   if (!res.ok) return [];

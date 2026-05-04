@@ -720,6 +720,17 @@ func (s *Server) handleChatHistory(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{"history": ag.WebChatHistory(sessionID)})
 }
 
+func (s *Server) handleChatTrace(w http.ResponseWriter, r *http.Request) {
+	agentID := r.URL.Query().Get("agentId")
+	sessionID := r.URL.Query().Get("sessionId")
+	ag := s.resolveAgent(r, agentID)
+	if ag == nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "agent not found"})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"trace": ag.WebChatTrace(sessionID)})
+}
+
 func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agentId")
 	ag := s.resolveAgent(r, agentID)
