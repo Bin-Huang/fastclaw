@@ -189,6 +189,44 @@ export function getAuthToken(): string {
 // and always includes the cookie session for username/password logins. Cookie
 // is the primary credential for the web UI; the bearer is only used by
 // programmatic clients that put the token into localStorage manually.
+//
+// Also handles 401 globally: when the server says the session has expired,
+// every page would otherwise just paint stale / empty data because
+// callers do `.catch(() => setX([]))` everywhere. We clear the token and
+// reload to "/" so the root page re-runs its auth probe and surfaces
+// the login form. Endpoints whose 401 is *information* (login attempts,
+// the "is anyone logged in" probe) opt out so they can render their own
+// UI instead of bouncing.
+const NO_AUTO_REDIRECT_PATHS = [
+  "/api/login",
+  "/api/logout",
+  "/api/me",
+  "/api/status",
+  "/api/onboard",
+];
+
+let redirectingDueToAuth = false;
+
+function shouldHandleAuth(url: string): boolean {
+  // Allow opting out per-call (used internally by login/me etc.). Also
+  // skip absolute URLs (off-host fetches) since we can't reason about
+  // their meaning.
+  if (!url.startsWith("/")) return false;
+  for (const skip of NO_AUTO_REDIRECT_PATHS) {
+    if (url === skip || url.startsWith(skip + "?")) return false;
+  }
+  return true;
+}
+
+function isOnAuthGate(): boolean {
+  if (typeof window === "undefined") return true;
+  const p = window.location.pathname;
+  // The root "/" hosts the login form; "/onboard" runs the first-time
+  // wizard. Either way, a 401 means "not logged in yet" — that's the
+  // expected state, no redirect needed.
+  return p === "/" || p.startsWith("/onboard");
+}
+
 export async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
   const token = getAuthToken();
   const headers: Record<string, string> = {
@@ -197,7 +235,20 @@ export async function apiFetch(url: string, init?: RequestInit): Promise<Respons
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
   }
-  return fetch(url, { credentials: "same-origin", ...init, headers });
+  const res = await fetch(url, { credentials: "same-origin", ...init, headers });
+  if (res.status === 401 && shouldHandleAuth(url) && !isOnAuthGate() && !redirectingDueToAuth) {
+    redirectingDueToAuth = true;
+    // Clear the bearer; the cookie will be cleared by the backend on
+    // its next 401 response (or by the next /api/logout). A hard reload
+    // — not router.replace — guarantees in-memory state and any
+    // mid-flight streams get torn down so the user lands on a clean
+    // login screen instead of the previous page's stale shell.
+    setAuthToken("");
+    if (typeof window !== "undefined") {
+      window.location.href = "/";
+    }
+  }
+  return res;
 }
 
 // Login + logout + me
