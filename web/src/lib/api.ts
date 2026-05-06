@@ -559,6 +559,96 @@ export async function getChatHistory(agentId: string, sessionId: string): Promis
   return Array.isArray(data) ? data : [];
 }
 
+// TraceMetadata carries per-turn diagnostics written by the agent loop
+// onto Message.Metadata: model name, wall-clock duration, and token
+// counts reported by the LLM (when the upstream API supports usage
+// reporting). Fields are omitted when the upstream didn't tell us —
+// treat absent as "unknown", not "zero". The shared `sandbox` flag
+// piggybacks on the same map for tool-role messages so legacy chat-UI
+// readers keep working.
+export interface TraceMetadata {
+  model?: string;
+  duration_ms?: number;
+  tokens_in?: number;
+  tokens_out?: number;
+  cache_read?: number;
+  cache_creation?: number;
+  sandbox?: boolean;
+}
+
+// TraceMessage is the wire shape returned by /api/chat/trace. Standalone
+// type — does NOT extend ChatHistoryMessage even though most fields look
+// the same. The two endpoints are independent contracts: chat history is
+// optimized for re-rendering bubbles, trace is optimized for diagnostic
+// timeline rendering. Coupling them via Omit<> would silently drag any
+// future ChatHistoryMessage field changes into the trace API.
+export interface TraceMessage {
+  role: "user" | "assistant" | "tool";
+  content?: string;
+  toolCalls?: { id: string; name: string; arguments: string }[];
+  name?: string;
+  toolCallId?: string;
+  imageUrls?: string[];
+  // Trace-specific:
+  timestamp?: number;
+  thinking?: string;
+  metadata?: TraceMetadata;
+}
+
+export async function getChatTrace(agentId: string, sessionId: string): Promise<TraceMessage[]> {
+  const res = await apiFetch(`/api/chat/trace?agentId=${encodeURIComponent(agentId)}&sessionId=${encodeURIComponent(sessionId)}`);
+  // 404 (session not found) is the legitimate "empty" — anything else is
+  // a real error and the caller wants to see it. Returning [] on every
+  // non-2xx would let the page render "No messages" on a 500 / 502 /
+  // network blip and silently lose the diagnostic.
+  if (res.status === 404) return [];
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const data = await res.json();
+      if (data?.error) detail = String(data.error);
+    } catch { /* non-JSON */ }
+    throw new Error(`getChatTrace failed: ${detail}`);
+  }
+  const data = await res.json();
+  if (Array.isArray(data?.trace)) return data.trace;
+  return Array.isArray(data) ? data : [];
+}
+
+// RunSummary is one row on the trace runs list page — wire shape from
+// /api/chat/runs. Aggregates are computed server-side (one walk over
+// each session's JSONL) so the UI stays a thin renderer.
+export interface RunSummary {
+  sessionId: string;
+  title: string;
+  preview: string;
+  thumbnailUrl?: string;
+  startedAt: number;
+  updatedAt: number;
+  durationMs: number;
+  turnCount: number;
+  toolCallCount: number;
+  tokensIn: number;
+  tokensOut: number;
+  models?: string[];
+}
+
+export async function getChatRuns(agentId: string): Promise<RunSummary[]> {
+  const res = await apiFetch(`/api/chat/runs?agentId=${encodeURIComponent(agentId)}`);
+  if (res.status === 404) return [];
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const data = await res.json();
+      if (data?.error) detail = String(data.error);
+    } catch { /* non-JSON */ }
+    throw new Error(`getChatRuns failed: ${detail}`);
+  }
+  const data = await res.json();
+  if (Array.isArray(data?.runs)) return data.runs;
+  return [];
+}
+
 export async function getChatSessions(agentId: string): Promise<{ id: string; title?: string; preview: string; thumbnailUrl?: string; createdAt?: number; updatedAt?: number }[]> {
   const res = await apiFetch(`/api/chat/sessions?agentId=${encodeURIComponent(agentId)}`);
   if (!res.ok) return [];

@@ -120,6 +120,21 @@ type Response struct {
 	ToolCalls    []ToolCall
 	Thinking     string          // model's reasoning/thinking content (extracted for memory)
 	RawAssistant json.RawMessage // exact API response message JSON (for cache-safe replay)
+	Usage        Usage           // token counts reported by the API; zero-valued when unavailable
+}
+
+// Usage captures token counts for one provider call. Populated from the
+// API's usage field — Anthropic emits it across message_start (input) +
+// message_delta (output); OpenAI emits it on the final stream chunk when
+// stream_options.include_usage is set, and inline on non-stream calls.
+// Zero values mean "the API didn't tell us" (older endpoints, partial
+// failures); callers should treat them as "unknown" rather than "zero
+// tokens used" for billing decisions.
+type Usage struct {
+	InputTokens         int `json:"input_tokens,omitempty"`
+	OutputTokens        int `json:"output_tokens,omitempty"`
+	CacheReadTokens     int `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 }
 
 // HasToolCalls returns true if the response contains tool calls.
@@ -138,6 +153,11 @@ type StreamChunk struct {
 	// extended-thinking providers (Anthropic + DeepSeek /anthropic compat).
 	Thinking          string
 	ThinkingSignature string
+	// Usage is non-nil only on the final (Done) chunk, and only when the
+	// upstream API reported it. Pointer so consumers can distinguish
+	// "not the final chunk" from "final chunk, no usage data" — both
+	// would look like a zero struct otherwise.
+	Usage *Usage
 }
 
 // StreamReader reads streaming chunks from an LLM response.

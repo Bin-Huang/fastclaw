@@ -286,6 +286,30 @@ type anthropicContentBlockDelta struct {
 	Delta anthropicDeltaContent `json:"delta"`
 }
 
+// anthropicMessageStart carries usage on the opening event — input
+// tokens (incl. cache_read / cache_creation breakdowns) and an initial
+// output_tokens (typically 1, just the role marker). Output tokens grow
+// across message_delta events; we read the FINAL message_delta to get
+// the real total.
+type anthropicMessageStart struct {
+	Type    string `json:"type"`
+	Message struct {
+		Usage anthropicUsage `json:"usage"`
+	} `json:"message"`
+}
+
+type anthropicMessageDelta struct {
+	Type  string `json:"type"`
+	Usage anthropicUsage `json:"usage"`
+}
+
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+}
+
 type anthropicDeltaContent struct {
 	Type        string `json:"type"` // "text_delta" | "input_json_delta" | "thinking_delta" | "signature_delta"
 	Text        string `json:"text,omitempty"`
@@ -351,6 +375,11 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 		}
 		blocks := make(map[int]*blockState)
 
+		// Accumulated usage: input_tokens land on message_start, output_tokens
+		// grow across message_delta events. We just keep overwriting on
+		// each event so the final value at message_stop is the real total.
+		var streamUsage Usage
+
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -364,6 +393,21 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 			}
 
 			switch event.Type {
+			case "message_start":
+				var ms anthropicMessageStart
+				if json.Unmarshal([]byte(data), &ms) == nil {
+					streamUsage.InputTokens = ms.Message.Usage.InputTokens
+					streamUsage.CacheReadTokens = ms.Message.Usage.CacheReadInputTokens
+					streamUsage.CacheCreationTokens = ms.Message.Usage.CacheCreationInputTokens
+					streamUsage.OutputTokens = ms.Message.Usage.OutputTokens
+				}
+
+			case "message_delta":
+				var md anthropicMessageDelta
+				if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
+					streamUsage.OutputTokens = md.Usage.OutputTokens
+				}
+
 			case "content_block_start":
 				var cbs anthropicContentBlockStart
 				if json.Unmarshal([]byte(data), &cbs) == nil {
@@ -435,12 +479,18 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 						}
 					}
 				}
+				var usagePtr *Usage
+				if streamUsage.InputTokens > 0 || streamUsage.OutputTokens > 0 {
+					u := streamUsage
+					usagePtr = &u
+				}
 				select {
 				case ch <- StreamChunk{
 					ToolCalls:         toolCalls,
 					Thinking:          thinkingText,
 					ThinkingSignature: thinkingSig,
 					Done:              true,
+					Usage:             usagePtr,
 				}:
 				case <-ctx.Done():
 				}
@@ -471,6 +521,7 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 		signature string
 	}
 	blocks := make(map[int]*blockState)
+	var usage Usage
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -486,6 +537,19 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 		}
 
 		switch event.Type {
+		case "message_start":
+			var ms anthropicMessageStart
+			if json.Unmarshal([]byte(data), &ms) == nil {
+				usage.InputTokens = ms.Message.Usage.InputTokens
+				usage.CacheReadTokens = ms.Message.Usage.CacheReadInputTokens
+				usage.CacheCreationTokens = ms.Message.Usage.CacheCreationInputTokens
+				usage.OutputTokens = ms.Message.Usage.OutputTokens
+			}
+		case "message_delta":
+			var md anthropicMessageDelta
+			if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
+				usage.OutputTokens = md.Usage.OutputTokens
+			}
 		case "content_block_start":
 			var cbs anthropicContentBlockStart
 			if json.Unmarshal([]byte(data), &cbs) == nil {
@@ -531,6 +595,7 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 
 	result := &Response{
 		Content: contentBuilder.String(),
+		Usage:   usage,
 	}
 	var thinkingBuilder strings.Builder
 	var thinkingSig string
