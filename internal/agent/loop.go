@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -301,6 +302,32 @@ func newContextBuilderWithSandbox(home, workspace string, memory *Memory, skills
 	return cb
 }
 
+// turnMetadata builds the per-assistant-turn metadata map written to
+// Message.Metadata. Surfaced by WebChatTrace so the trace UI can render
+// "model · duration · tokens" without paying for any new database
+// schema. Zero-valued usage fields are omitted so downstream renderers
+// can distinguish "API didn't report" from "literally zero" — see the
+// Usage struct doc in provider.go.
+func turnMetadata(model string, start time.Time, u provider.Usage) map[string]any {
+	m := map[string]any{
+		"model":       model,
+		"duration_ms": time.Since(start).Milliseconds(),
+	}
+	if u.InputTokens > 0 {
+		m["tokens_in"] = u.InputTokens
+	}
+	if u.OutputTokens > 0 {
+		m["tokens_out"] = u.OutputTokens
+	}
+	if u.CacheReadTokens > 0 {
+		m["cache_read"] = u.CacheReadTokens
+	}
+	if u.CacheCreationTokens > 0 {
+		m["cache_creation"] = u.CacheCreationTokens
+	}
+	return m
+}
+
 // Name returns the agent's name.
 func (a *Agent) Name() string {
 	return a.name
@@ -489,6 +516,182 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 		}
 	}
 	return history
+}
+
+// WebChatTrace is the richer sibling of WebChatHistory used by the trace
+// viewer: returns the same per-message shape but also surfaces fields the
+// chat UI hides — `timestamp` (ms since epoch, when the message landed in
+// the session log) and `thinking` (the model's pre-tool-call reasoning).
+// Callers that want to render a turn-by-turn timeline read these to draw
+// relative-time gaps and folding "thinking" panels.
+func (a *Agent) WebChatTrace(sessionId string) []map[string]any {
+	if sessionId == "" {
+		sessionId = "web-ui"
+	}
+	sess := a.sessions.Get("web", sessionId)
+	msgs := sess.GetMessages()
+	var trace []map[string]any
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			text := m.TextContent()
+			var imageURLs []string
+			for _, p := range m.ContentParts {
+				if p.Type == "image_url" && p.ImageURL != nil && p.ImageURL.URL != "" {
+					imageURLs = append(imageURLs, p.ImageURL.URL)
+				}
+			}
+			if text == "" && len(imageURLs) == 0 {
+				continue
+			}
+			entry := map[string]any{"role": "user", "content": text, "timestamp": m.Timestamp}
+			if len(imageURLs) > 0 {
+				entry["imageUrls"] = imageURLs
+			}
+			trace = append(trace, entry)
+		case "assistant":
+			entry := map[string]any{"role": "assistant", "timestamp": m.Timestamp}
+			if m.Content != "" {
+				entry["content"] = m.Content
+			}
+			if m.Thinking != "" {
+				entry["thinking"] = m.Thinking
+			}
+			if len(m.ToolCalls) > 0 {
+				var calls []map[string]string
+				for _, tc := range m.ToolCalls {
+					calls = append(calls, map[string]string{
+						"id":        tc.ID,
+						"name":      tc.Function.Name,
+						"arguments": tc.Function.Arguments,
+					})
+				}
+				entry["toolCalls"] = calls
+			}
+			if len(m.Metadata) > 0 {
+				entry["metadata"] = m.Metadata
+			}
+			if m.Content == "" && m.Thinking == "" && len(m.ToolCalls) == 0 {
+				continue
+			}
+			trace = append(trace, entry)
+		case "tool":
+			entry := map[string]any{
+				"role":       "tool",
+				"content":    m.Content,
+				"name":       m.Name,
+				"toolCallId": m.ToolCallID,
+				"timestamp":  m.Timestamp,
+			}
+			if len(m.Metadata) > 0 {
+				entry["metadata"] = m.Metadata
+			}
+			trace = append(trace, entry)
+		}
+	}
+	return trace
+}
+
+// metadataInt extracts an integer out of a Message.Metadata value.
+// In-memory writes use int; messages loaded from JSONL come back as
+// float64 because that's what json.Unmarshal does to a map[string]any
+// number. Without this normalization the runs aggregator would
+// silently drop every persisted turn's token counts.
+func metadataInt(m map[string]any, key string) int {
+	if m == nil {
+		return 0
+	}
+	switch v := m[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+// RunSummary is one row on the trace runs list page: a session plus the
+// aggregate numbers computed from its message log. Fields without a
+// natural "unknown" zero value (TokensIn/Out, ToolCallCount) come back
+// as 0 when the underlying messages don't carry metadata — same
+// "absent vs. literally zero" caveat as Usage.
+type RunSummary struct {
+	SessionID     string   `json:"sessionId"`
+	Title         string   `json:"title"`
+	Preview       string   `json:"preview"`
+	ThumbnailURL  string   `json:"thumbnailUrl,omitempty"`
+	StartedAt     int64    `json:"startedAt"`
+	UpdatedAt     int64    `json:"updatedAt"`
+	DurationMs    int64    `json:"durationMs"`
+	TurnCount     int      `json:"turnCount"`
+	ToolCallCount int      `json:"toolCallCount"`
+	TokensIn      int      `json:"tokensIn"`
+	TokensOut     int      `json:"tokensOut"`
+	Models        []string `json:"models,omitempty"`
+}
+
+// WebChatRuns scans every web session, walks its message log once, and
+// returns a per-session summary tailored to the trace runs list page —
+// counts + totals + a distinct-model set so the table can show
+// "claude-sonnet-4-6" vs. "gpt-4o" at a glance. O(total messages); fine
+// for typical use, swap in a cached aggregate table only when the JSONL
+// scan becomes the bottleneck.
+func (a *Agent) WebChatRuns() []RunSummary {
+	sessions := a.sessions.ListWebSessions()
+	out := make([]RunSummary, 0, len(sessions))
+	for _, ws := range sessions {
+		sess := a.sessions.Get("web", ws.ID)
+		msgs := sess.GetMessages()
+		row := RunSummary{
+			SessionID:    ws.ID,
+			Title:        ws.Title,
+			Preview:      ws.Preview,
+			ThumbnailURL: ws.ThumbnailURL,
+			StartedAt:    ws.CreatedAt,
+			UpdatedAt:    ws.UpdatedAt,
+		}
+		var firstTs, lastTs int64
+		seenModels := map[string]struct{}{}
+		for _, m := range msgs {
+			if m.Timestamp > 0 {
+				if firstTs == 0 || m.Timestamp < firstTs {
+					firstTs = m.Timestamp
+				}
+				if m.Timestamp > lastTs {
+					lastTs = m.Timestamp
+				}
+			}
+			switch m.Role {
+			case "user":
+				row.TurnCount++
+			case "assistant":
+				row.ToolCallCount += len(m.ToolCalls)
+				row.TokensIn += metadataInt(m.Metadata, "tokens_in")
+				row.TokensOut += metadataInt(m.Metadata, "tokens_out")
+				if model, ok := m.Metadata["model"].(string); ok && model != "" {
+					seenModels[model] = struct{}{}
+				}
+			}
+		}
+		if firstTs > 0 && lastTs > firstTs {
+			row.DurationMs = lastTs - firstTs
+		}
+		if len(seenModels) > 0 {
+			models := make([]string, 0, len(seenModels))
+			for k := range seenModels {
+				models = append(models, k)
+			}
+			// Sort so the rendered "claude-sonnet-4-6, gpt-4o" doesn't
+			// flip between requests — Go map iteration order is
+			// randomized per run, which would cause UI jitter.
+			sort.Strings(models)
+			row.Models = models
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 // WebChatSessions returns a list of web chat sessions with metadata.
@@ -784,7 +987,14 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		}
 
 		if !resp.HasToolCalls() {
-			sess.Append(provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant})
+			sess.Append(provider.Message{
+				Role:         "assistant",
+				Content:      resp.Content,
+				Thinking:     resp.Thinking,
+				Timestamp:    time.Now().UnixMilli(),
+				RawAssistant: resp.RawAssistant,
+				Metadata:     turnMetadata(a.model, hcBefore.StartTime, resp.Usage),
+			})
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			a.runPostTurn(ctx, messages, totalToolCalls)
@@ -812,6 +1022,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			Thinking:     resp.Thinking,
 			Timestamp:    time.Now().UnixMilli(),
 			RawAssistant: resp.RawAssistant,
+			Metadata:     turnMetadata(a.model, hcBefore.StartTime, resp.Usage),
 		}
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)

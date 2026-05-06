@@ -6,7 +6,7 @@ import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type ChatStreamEvent, type SkillInfo, type ToolResultMetadata, type WorkspaceFile } from "@/lib/api";
-import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square, FolderOpen, RefreshCw } from "lucide-react";
+import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square, FolderOpen, RefreshCw, ScrollText } from "lucide-react";
 import Link from "next/link";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -514,13 +514,25 @@ export default function AgentChatPage() {
   // sidebar toggle). Re-fires whenever the title changes.
   const headerSlot = useMemo(
     () => (
-      <ChatHeaderTitle
-        title={sessionTitle}
-        fallback={`Chat with ${agentName || selectedAgent}`}
-        onSave={handleRenameTitle}
-      />
+      <div className="flex items-center gap-2 min-w-0 flex-1">
+        <ChatHeaderTitle
+          title={sessionTitle}
+          fallback={`Chat with ${agentName || selectedAgent}`}
+          onSave={handleRenameTitle}
+        />
+        {selectedAgent && sessionId && (
+          <Link
+            href={`/agents/${selectedAgent}/runs/?session=${encodeURIComponent(sessionId)}`}
+            className="ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 shrink-0"
+            title="Inspect this run"
+          >
+            <ScrollText className="size-3.5" />
+            Inspect
+          </Link>
+        )}
+      </div>
     ),
-    [sessionTitle, agentName, selectedAgent, handleRenameTitle],
+    [sessionTitle, agentName, selectedAgent, sessionId, handleRenameTitle],
   );
   usePageHeader(headerSlot, [headerSlot]);
 

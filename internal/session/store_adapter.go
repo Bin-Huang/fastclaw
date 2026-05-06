@@ -39,6 +39,13 @@ func (a *StoreAdapter) GetSession(ctx context.Context, agentID, sessionKey strin
 			Thinking:     m.Thinking,
 			RawAssistant: m.RawAssistant,
 		}
+		// store.SessionMessage uses time.Time; provider.Message uses
+		// unix ms. Without this round-trip line, every store-backed
+		// session loses per-message timestamps and the trace viewer's
+		// relative-time offsets / runs duration column read as 0.
+		if !m.Timestamp.IsZero() {
+			msgs[i].Timestamp = m.Timestamp.UnixMilli()
+		}
 		// ToolCalls / ContentParts are stored as interface{} so a
 		// JSON round-trip leaves them as []interface{} / map nests.
 		// Re-marshal + unmarshal to recover the typed slice — without
@@ -103,13 +110,23 @@ func (a *StoreAdapter) ListMessages(ctx context.Context, agentID, sessionKey str
 // session_messages (as a row). Single conversion site so the two paths
 // can't drift.
 func sessionMessageFromProvider(m provider.Message) store.SessionMessage {
+	// Honor caller-supplied Timestamp (set by Session.Append for every
+	// new turn). Falling back to time.Now() unconditionally dropped the
+	// per-turn ms epoch and made every store-backed session look like
+	// all messages arrived at the moment of the most recent save — the
+	// trace viewer's relative offsets / runs duration column then read
+	// 0 across the board.
+	ts := time.Now()
+	if m.Timestamp > 0 {
+		ts = time.UnixMilli(m.Timestamp)
+	}
 	out := store.SessionMessage{
 		Role:         m.Role,
 		Content:      m.Content,
 		ToolCallID:   m.ToolCallID,
 		Name:         m.Name,
 		Metadata:     m.Metadata,
-		Timestamp:    time.Now(),
+		Timestamp:    ts,
 		Thinking:     m.Thinking,
 		RawAssistant: m.RawAssistant,
 	}
@@ -135,6 +152,12 @@ func providerMessageFromStored(m store.SessionMessage) provider.Message {
 		Metadata:     m.Metadata,
 		Thinking:     m.Thinking,
 		RawAssistant: m.RawAssistant,
+	}
+	// store uses time.Time, provider.Message uses unix ms — same
+	// conversion as in GetSession's inline reader, kept here so the
+	// session_messages archive path (ListMessages) doesn't drop ts.
+	if !m.Timestamp.IsZero() {
+		out.Timestamp = m.Timestamp.UnixMilli()
 	}
 	if m.ToolCalls != nil {
 		if raw, err := json.Marshal(m.ToolCalls); err == nil {

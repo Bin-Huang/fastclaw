@@ -46,12 +46,31 @@ type apiMessage struct {
 }
 
 type chatRequest struct {
-	Model       string            `json:"model"`
-	Messages    []json.RawMessage `json:"messages"`
-	Tools       []Tool            `json:"tools,omitempty"`
-	MaxTokens   int               `json:"max_tokens,omitempty"`
-	Temperature float64           `json:"temperature,omitempty"`
-	Stream      bool              `json:"stream"`
+	Model         string            `json:"model"`
+	Messages      []json.RawMessage `json:"messages"`
+	Tools         []Tool            `json:"tools,omitempty"`
+	MaxTokens     int               `json:"max_tokens,omitempty"`
+	Temperature   float64           `json:"temperature,omitempty"`
+	Stream        bool              `json:"stream"`
+	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
+}
+
+// streamOptions.include_usage asks the API to emit a final SSE chunk
+// carrying { usage: { prompt_tokens, completion_tokens } } before [DONE].
+// Without this opt-in, OpenAI's stream omits usage entirely. Only sent
+// when stream=true; non-stream calls already inline usage on the
+// response object.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
+type apiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
 }
 
 // toAPIMessages converts provider Messages to wire-format apiMessages,
@@ -103,6 +122,7 @@ type sseChoice struct {
 
 type sseResponse struct {
 	Choices []sseChoice `json:"choices"`
+	Usage   *apiUsage   `json:"usage,omitempty"`
 }
 
 func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, stream bool) (*http.Request, error) {
@@ -112,6 +132,11 @@ func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, t
 		MaxTokens:   maxTokens,
 		Temperature: temperature,
 		Stream:      stream,
+	}
+	if stream {
+		// Opt into the final usage chunk; non-stream responses already
+		// carry usage inline on the top-level object.
+		req.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
 	if len(tools) > 0 {
 		req.Tools = tools
@@ -182,6 +207,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 		toolCalls := make(map[int]*ToolCall)
+		var streamUsage *Usage
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -198,7 +224,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 					}
 				}
 				select {
-				case ch <- StreamChunk{ToolCalls: tcs, Done: true}:
+				case ch <- StreamChunk{ToolCalls: tcs, Done: true, Usage: streamUsage}:
 				case <-ctx.Done():
 				}
 				return
@@ -208,6 +234,19 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				slog.Warn("parse SSE chunk", "error", err, "data", data)
 				continue
+			}
+
+			// Final usage chunk arrives with empty choices; capture and
+			// continue so the [DONE] terminator still fires.
+			if chunk.Usage != nil {
+				u := Usage{
+					InputTokens:  chunk.Usage.PromptTokens,
+					OutputTokens: chunk.Usage.CompletionTokens,
+				}
+				if chunk.Usage.PromptTokensDetails != nil {
+					u.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+				}
+				streamUsage = &u
 			}
 
 			if len(chunk.Choices) == 0 {
@@ -267,6 +306,7 @@ func (p *OpenAIProvider) parseSSE(reader io.Reader) (*Response, error) {
 
 	var contentBuilder strings.Builder
 	toolCalls := make(map[int]*ToolCall)
+	var usage Usage
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -282,6 +322,14 @@ func (p *OpenAIProvider) parseSSE(reader io.Reader) (*Response, error) {
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			slog.Warn("parse SSE chunk", "error", err, "data", data)
 			continue
+		}
+
+		if chunk.Usage != nil {
+			usage.InputTokens = chunk.Usage.PromptTokens
+			usage.OutputTokens = chunk.Usage.CompletionTokens
+			if chunk.Usage.PromptTokensDetails != nil {
+				usage.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -326,6 +374,7 @@ func (p *OpenAIProvider) parseSSE(reader io.Reader) (*Response, error) {
 
 	result := &Response{
 		Content: contentBuilder.String(),
+		Usage:   usage,
 	}
 	for i := 0; i < len(toolCalls); i++ {
 		if tc, ok := toolCalls[i]; ok {
